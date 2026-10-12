@@ -1,0 +1,85 @@
+import { createServerClient } from '@supabase/ssr'
+import { NextResponse, type NextRequest } from 'next/server'
+
+export async function updateSession(request: NextRequest) {
+  let supabaseResponse = NextResponse.next({
+    request,
+  })
+
+  const supabase = createServerClient(
+    process.env.NEXT_PUBLIC_SUPABASE_URL!,
+    process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY!,
+    {
+      cookies: {
+        getAll() {
+          return request.cookies.getAll()
+        },
+        setAll(cookiesToSet) {
+          cookiesToSet.forEach(({ name, value, options }) => request.cookies.set(name, value))
+          supabaseResponse = NextResponse.next({
+            request,
+          })
+          cookiesToSet.forEach(({ name, value, options }) =>
+            supabaseResponse.cookies.set(name, value, options)
+          )
+        },
+      },
+    }
+  )
+
+  // IMPORTANTE: Evitar bucles infinitos refrescando la sesión de Auth
+  const {
+    data: { user },
+  } = await supabase.auth.getUser()
+
+  const url = request.nextUrl.clone()
+  const pathname = url.pathname
+
+  // 1. Si no hay usuario y trata de entrar a áreas protegidas (/dashboard o /admin), redirigir al login
+  if (!user && (pathname.startsWith('/dashboard') || pathname.startsWith('/admin'))) {
+    url.pathname = '/login'
+    return NextResponse.redirect(url)
+  }
+
+  // 2. Si hay usuario, verificamos su rol en la tabla profiles
+  if (user && (pathname.startsWith('/dashboard') || pathname.startsWith('/admin') || pathname === '/login')) {
+    const { data: profile } = await supabase
+      .from('profiles')
+      .select('role, account_status')
+      .eq('id', user.id)
+      .single()
+
+    // Si la cuenta está inactiva, cerramos sesión o bloqueamos
+    if (profile?.account_status === 'inactive') {
+      await supabase.auth.signOut()
+      url.pathname = '/login'
+      return NextResponse.redirect(url)
+    }
+
+    const role = profile?.role || 'client'
+
+    // Si está en /login y ya inició sesión, redirigir según su rol
+    if (pathname === '/login') {
+      if (role === 'admin') {
+        url.pathname = '/admin/tickets'
+      } else {
+        url.pathname = '/dashboard'
+      }
+      return NextResponse.redirect(url)
+    }
+
+    // Proteger rutas de administración: si un cliente intenta entrar a /admin, mandarlo a su dashboard
+    if (pathname.startsWith('/admin') && role !== 'admin') {
+      url.pathname = '/dashboard'
+      return NextResponse.redirect(url)
+    }
+
+    // Proteger rutas de cliente: si un admin entra a /dashboard, opcionalmente podemos dejarlo o mandarlo a su panel
+    if (pathname.startsWith('/dashboard') && role === 'admin') {
+      url.pathname = '/admin/tickets'
+      return NextResponse.redirect(url)
+    }
+  }
+
+  return supabaseResponse
+}
